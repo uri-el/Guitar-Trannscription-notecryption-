@@ -1,0 +1,32 @@
+# Core audio
+numpy
+soundfile
+sounddevice
+librosa
+
+# Pitch detection (requires TensorFlow backend)
+basic-pitch[tf]
+tensorflow-cpu==2.15.0
+
+# ML / Basic Pitch dependencies (pinned for compatibility)
+jax>=0.4.16
+jaxlib>=0.4.16
+flax==0.10.7
+grain==0.2.0
+seqio==0.0.19
+
+# Source separation
+demucs
+
+# MIDI
+pretty_midi
+
+# GUI
+PyQt6
+PyQt6-WebEngine
+
+# HTTP (Klangio cloud API)
+requests
+
+# Optional: FFmpeg wrapper for audio conversion
+imageio-ffmpeg

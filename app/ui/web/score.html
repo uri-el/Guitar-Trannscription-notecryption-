@@ -1,0 +1,238 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Score</title>
+  <script src="osmd.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      background: #1e1f22;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      overflow: hidden;
+    }
+    #wrap {
+      height: 100vh;
+      width: 100vw;
+      overflow: auto;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 22px 0;
+    }
+    #paper {
+      display: none;
+      position: relative;
+      background: #ffffff;
+      border-radius: 12px;
+      box-shadow: 0 14px 40px rgba(0,0,0,0.35);
+      padding: 18px 18px 22px 18px;
+      width: min(1100px, calc(100vw - 40px));
+    }
+    #osmd { width: 100%; }
+    #playhead {
+      display: none;
+      position: absolute;
+      width: 2px;
+      background: #e03030;
+      pointer-events: none;
+      border-radius: 1px;
+      z-index: 10;
+    }
+
+    @media print {
+      body { background: white; overflow: visible; }
+      #wrap {
+        height: auto; overflow: visible; background: white;
+        padding: 0; display: block;
+      }
+      #paper {
+        display: block !important;
+        width: 100%; box-shadow: none; border-radius: 0;
+        padding: 8px; margin: 0;
+      }
+      #playhead { display: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="paper">
+      <div id="osmd"></div>
+      <div id="playhead"></div>
+    </div>
+  </div>
+
+  <script>
+    let osmd = null;
+    let _tempo = 120;
+    let _xmlText = null;
+    let _map = []; // [{sec, left, top, height}] per cursor step
+    let _pendingT = null;
+
+    // Extract BPM from MusicXML text
+    function _parseTempo(xml) {
+      let m = xml.match(/tempo\s*=\s*"([\d.]+)"/i);
+      if (m) return Number(m[1]);
+      m = xml.match(/<per-minute>\s*([\d.]+)\s*<\/per-minute>/i);
+      if (m) return Number(m[1]);
+      return 120;
+    }
+
+    // Build ordered array of onset seconds (one per OSMD cursor step)
+    // Only parses staff=1 notes; staff=2 (TAB) duplicates are skipped
+    function _parseOnsetSeconds(xmlText, tempo) {
+      let doc;
+      try {
+        doc = new DOMParser().parseFromString(xmlText, "text/xml");
+        if (doc.querySelector("parsererror")) { console.warn("[OSMD] parse error"); return []; }
+      } catch(e) { return []; }
+
+      const divsEl = doc.querySelector("divisions");
+      const divs = divsEl ? parseInt(divsEl.textContent, 10) : 960;
+      if (!divs || divs <= 0) return [];
+
+      const secPerTick = 60.0 / (divs * tempo);
+      const allTicks = [];
+
+      for (const part of doc.querySelectorAll("score-partwise > part")) {
+        let tick = 0;
+        for (const measure of part.querySelectorAll("measure")) {
+          for (const el of measure.children) {
+            const tag = el.tagName.toLowerCase();
+            if (tag === "note") {
+              const dur = parseInt((el.querySelector("duration") || {}).textContent || "0", 10);
+              const isChord = !!el.querySelector("chord");
+              const staffEl = el.querySelector("staff");
+              const staff = staffEl ? parseInt(staffEl.textContent, 10) : 1;
+              if (staff !== 1) continue; // skip TAB staff duplicate
+              if (!isChord) { allTicks.push(tick); tick += dur; }
+            } else if (tag === "backup") {
+              tick -= parseInt((el.querySelector("duration") || {}).textContent || "0", 10);
+            } else if (tag === "forward") {
+              tick += parseInt((el.querySelector("duration") || {}).textContent || "0", 10);
+            }
+          }
+        }
+      }
+
+      return allTicks.map(t => Math.max(0, t) * secPerTick);
+    }
+
+    // Init OSMD instance
+    async function init() {
+      osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay("osmd", {
+        drawingParameters: "default",
+        autoResize: true,
+        backend: "svg",
+        pageFormat: "Endless",
+        disableCursor: false,
+      });
+    }
+
+    // Wait 2 animation frames for DOM to settle
+    function _raf2() {
+      return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }
+
+    // Walk OSMD cursor to build sec→position map
+    async function _buildMap() {
+      _map = [];
+      const paper = document.getElementById("paper");
+      const svg = document.querySelector("#osmd svg");
+      if (!svg) { console.warn("[OSMD] no SVG"); return; }
+
+      const onsets = _xmlText ? _parseOnsetSeconds(_xmlText, _tempo) : [];
+
+      try {
+        osmd.cursor.show();
+        osmd.cursor.reset();
+        await _raf2();
+      } catch (e) { console.error("[OSMD] cursor init:", e); return; }
+
+      let guard = 0, onsetIdx = 0;
+      while (guard++ < 20000) {
+        const sec = onsetIdx < onsets.length
+          ? onsets[onsetIdx]
+          : (onsets.length > 0 ? onsets[onsets.length - 1] : 0);
+        onsetIdx++;
+
+        const el = osmd.cursor.cursorElement;
+        if (el) {
+          const r = el.getBoundingClientRect();
+          const pr = paper.getBoundingClientRect();
+          const left = r.left - pr.left, top = r.top - pr.top, height = r.height;
+          if (height > 0 && isFinite(left) && isFinite(top))
+            _map.push({ sec, left, top, height });
+        }
+
+        try { if (!osmd.cursor.next()) break; }
+        catch(e) { console.warn("[OSMD] cursor.next():", e); break; }
+      }
+
+      try { osmd.cursor.hide(); } catch (e) {}
+      if (_pendingT !== null) setPlayheadSeconds(_pendingT);
+    }
+
+    // Load and render MusicXML, then build playhead map
+    async function loadMusicXML(xmlText) {
+      if (!osmd) await init();
+      document.getElementById("paper").style.display = "block";
+      _xmlText = xmlText;
+      _tempo = _parseTempo(xmlText);
+      await osmd.load(xmlText);
+      await osmd.render();
+      await _raf2();
+      await _buildMap();
+    }
+
+    // Binary search: rightmost map entry with sec <= t
+    function _findIndexBySeconds(t) {
+      let lo = 0, hi = _map.length - 1, ans = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (_map[mid].sec <= t) { ans = mid; lo = mid + 1; }
+        else { hi = mid - 1; }
+      }
+      return ans;
+    }
+
+    // Move red playhead line to given time and scroll into view
+    function setPlayheadSeconds(t) {
+      _pendingT = t;
+      const ph = document.getElementById("playhead");
+      const wrap = document.getElementById("wrap");
+      if (!_map.length) { ph.style.display = "none"; return; }
+
+      const tt = Math.max(0, Number(t) || 0);
+      const m = _map[_findIndexBySeconds(tt)];
+      ph.style.display = "block";
+      ph.style.left = `${m.left}px`;
+      ph.style.top  = `${m.top}px`;
+      ph.style.height = `${Math.max(24, m.height)}px`;
+
+      const phRect = ph.getBoundingClientRect();
+      const wrapRect = wrap.getBoundingClientRect();
+      if (phRect.right > wrapRect.right - 40)
+        wrap.scrollLeft += (phRect.right - (wrapRect.right - 40));
+      else if (phRect.left < wrapRect.left + 40)
+        wrap.scrollLeft -= ((wrapRect.left + 40) - phRect.left);
+      if (phRect.bottom > wrapRect.bottom - 40)
+        wrap.scrollTop += (phRect.bottom - (wrapRect.bottom - 40));
+      else if (phRect.top < wrapRect.top + 40)
+        wrap.scrollTop -= ((wrapRect.top + 40) - phRect.top);
+    }
+
+    // Store total duration for external use
+    function setDurationSeconds(d) {
+      window.__lastDurationSeconds = Number(d) || 0;
+    }
+
+    window.loadMusicXML = loadMusicXML;
+    window.setPlayheadSeconds = setPlayheadSeconds;
+    window.setDurationSeconds = setDurationSeconds;
+
+    init();
+  </script>
+</body>
+</html>
